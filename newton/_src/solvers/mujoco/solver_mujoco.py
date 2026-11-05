@@ -8235,6 +8235,64 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             device=self.model.device,
         )
 
+    def _constant_refresh_storage(self):
+        """Bind one constant-refresh graph to this solver's model and data storage."""
+        import dataclasses
+
+        arrays = []
+        signature = []
+
+        def visit(path, value):
+            if isinstance(value, wp.array):
+                arrays.append(value)
+                signature.append((path, value.ptr, value.shape, value.strides, value.dtype, value.device))
+            elif dataclasses.is_dataclass(value):
+                for field in dataclasses.fields(value):
+                    visit(path + "." + field.name, getattr(value, field.name))
+            elif isinstance(value, tuple):
+                for index, item in enumerate(value):
+                    visit(path + "." + str(index), item)
+            elif isinstance(value, (int, float, bool, str, type(None))):
+                signature.append((path, value))
+
+        visit("model", self.mjw_model)
+        visit("data", self.mjw_data)
+        return (id(self.mjw_model), id(self.mjw_data), tuple(signature)), tuple(arrays)
+
+    def _set_const_0_graphed(self):
+        """Replay the original GPU constant calculation for fixed solver-owned storage."""
+        if not getattr(self, "_constant_refresh_graph_enabled", False):
+            self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
+            return
+        stream = wp.get_stream(self.model.device)
+        if stream.is_capturing:
+            raise RuntimeError("constant refresh must run at the eager model-notification boundary")
+        signature, arrays = self._constant_refresh_storage()
+        graph = getattr(self, "_constant_refresh_graph", None)
+        if graph is None:
+            # Execute exactly one requested refresh. Recording the second call does
+            # not execute it. Its clone/copy operations read current inputs on replay.
+            self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
+            warmed_signature, warmed_arrays = self._constant_refresh_storage()
+            if signature != warmed_signature:
+                raise RuntimeError("constant refresh replaced model/data storage during warmup")
+            with wp.ScopedCapture(stream=stream) as capture:
+                self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
+            captured_signature, _ = self._constant_refresh_storage()
+            if signature != captured_signature:
+                raise RuntimeError("constant refresh replaced model/data storage during capture")
+            # The solver owns the graph and retains all of its external array
+            # bindings. Warp's graph owns its captured scratch allocation nodes.
+            self._constant_refresh_graph = capture.graph
+            self._constant_refresh_graph_signature = signature
+            self._constant_refresh_graph_arrays = warmed_arrays
+            self._constant_refresh_graph_replays = 0
+        else:
+            if signature != self._constant_refresh_graph_signature:
+                raise RuntimeError("constant refresh model/data storage or static configuration changed")
+            wp.capture_launch(graph, stream=stream)
+            self._constant_refresh_graph_replays += 1
+
     def _set_const_0_with_physical_meaninertia(self) -> None:
         """Recompute constants without counting kinematic locking armature in solver statistics."""
         has_kinematic_bodies = bool(np.any((self.model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0))
@@ -8242,7 +8300,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             if self.use_mujoco_cpu:
                 self._mujoco.mj_setConst(self.mj_model, self.mj_data)
             else:
-                self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
+                self._set_const_0_graphed()
             return
 
         # Subtracting the locking armature in float32 would lose the physical inertia.
@@ -8260,12 +8318,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self.mj_model.stat.meaninertia = physical_meaninertia
         else:
             actuator_biasprm = wp.clone(self.mjw_model.actuator_biasprm)
-            self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
+            self._set_const_0_graphed()
             physical_meaninertia = wp.clone(self.mjw_model.stat.meaninertia)
 
             self._update_body_properties()
             wp.copy(self.mjw_model.actuator_biasprm, actuator_biasprm)
-            self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
+            self._set_const_0_graphed()
             wp.copy(self.mjw_model.stat.meaninertia, physical_meaninertia)
 
     def _update_body_properties(self, apply_kinematic_armature: bool = True):
