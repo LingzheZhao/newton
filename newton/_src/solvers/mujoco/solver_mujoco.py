@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.metadata as importlib_metadata
 import math
 import os
@@ -8237,8 +8238,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
     def _constant_refresh_storage(self):
         """Bind one constant-refresh graph to this solver's model and data storage."""
-        import dataclasses
-
         arrays = []
         signature = []
 
@@ -8267,7 +8266,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         stream = wp.get_stream(self.model.device)
         if stream.is_capturing:
             raise RuntimeError("constant refresh must run at the eager model-notification boundary")
-        signature, arrays = self._constant_refresh_storage()
+        signature, _arrays = self._constant_refresh_storage()
         graph = getattr(self, "_constant_refresh_graph", None)
         if graph is None:
             # Execute exactly one requested refresh. Recording the second call does
