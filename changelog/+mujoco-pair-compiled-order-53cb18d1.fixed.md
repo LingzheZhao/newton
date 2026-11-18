@@ -1,0 +1,1 @@
+Fix `SolverMuJoCo` writing the friction, `solref`, `solreffriction`, `solimp`, margin and gap of explicit MJCF `<pair>` contacts to the wrong MuJoCo Warp pair when MuJoCo's compiler reorders the pairs, which it does when the pairs are not written in the order of their bodies.

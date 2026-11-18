@@ -10294,6 +10294,61 @@ class TestMuJoCoSolverPairProperties(unittest.TestCase):
 
         self.assertEqual(solver.mj_model.npair, 1, "Global pair should be exported to MuJoCo spec")
 
+    @requires(*MUJOCO_MODULES)
+    def test_explicit_pair_properties_follow_compiled_pair_order(self):
+        """Each compiled pair keeps its own parameters when MuJoCo reorders the pairs.
+
+        MuJoCo's compiler sorts explicit pairs by their two bodies, so these pairs, written
+        in the order (b2, b3), (b3, b1), (b1, b2), compile in the reverse order.
+        """
+        mjcf = """<mujoco>
+            <worldbody>
+                <body name="b1"><freejoint/><geom name="g1" type="sphere" size="0.1"/></body>
+                <body name="b2" pos="1 0 0"><freejoint/><geom name="g2" type="sphere" size="0.1"/></body>
+                <body name="b3" pos="2 0 0"><freejoint/><geom name="g3" type="sphere" size="0.1"/></body>
+            </worldbody>
+            <contact>
+                <pair geom1="g2" geom2="g3" friction="0.3 0.31 0.003 0.0003 0.0003" solref="0.03 1.3"
+                      solreffriction="0.033 1.33" solimp="0.83 0.93 0.003 0.53 2.3" gap="0.003"/>
+                <pair geom1="g3" geom2="g1" friction="0.5 0.51 0.005 0.0005 0.0005" solref="0.05 1.5"
+                      solreffriction="0.055 1.55" solimp="0.85 0.95 0.005 0.55 2.5" gap="0.005"/>
+                <pair geom1="g1" geom2="g2" friction="0.7 0.71 0.007 0.0007 0.0007" solref="0.07 1.7"
+                      solreffriction="0.077 1.77" solimp="0.87 0.97 0.007 0.57 2.7" gap="0.007"/>
+            </contact>
+        </mujoco>"""
+        mujoco, _ = SolverMuJoCo.import_mujoco()
+        native = mujoco.MjModel.from_xml_string(mjcf)
+        builder = newton.ModelBuilder()
+        builder.add_mjcf(mjcf)
+        model = builder.finalize()
+        solver = SolverMuJoCo(model)
+
+        def pair_rows(mj_model, geom_name):
+            return {
+                frozenset((geom_name(mj_model.pair_geom1[row]), geom_name(mj_model.pair_geom2[row]))): row
+                for row in range(mj_model.npair)
+            }
+
+        geom_to_shape = solver.mjc_geom_to_newton_shape.numpy()[0]
+        native_rows = pair_rows(native, lambda geom: native.geom(geom).name)
+        solver_rows = pair_rows(solver.mj_model, lambda geom: model.shape_label[geom_to_shape[geom]].rsplit("/", 1)[-1])
+
+        # Without the reordering this test would not exercise the row mapping.
+        written = [frozenset(("g2", "g3")), frozenset(("g1", "g3")), frozenset(("g1", "g2"))]
+        self.assertEqual(sorted(native_rows, key=native_rows.get), written[::-1])
+        self.assertEqual(sorted(solver_rows, key=solver_rows.get), written[::-1])
+
+        for field in ("pair_friction", "pair_solref", "pair_solreffriction", "pair_solimp", "pair_gap"):
+            solver_values = getattr(solver.mjw_model, field).numpy()[0]
+            native_values = getattr(native, field)
+            for pair, row in native_rows.items():
+                np.testing.assert_allclose(
+                    solver_values[solver_rows[pair]],
+                    native_values[row],
+                    rtol=1.0e-6,
+                    err_msg=f"{field} of the pair {sorted(pair)}",
+                )
+
     @requires("pxr.Usd")
     def test_joint_dof_label_resolution_all_joint_types(self):
         """Test that mujoco:joint_dof_label resolves correctly for fixed, revolute, spherical, and D6 joints."""

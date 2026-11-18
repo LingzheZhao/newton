@@ -3656,7 +3656,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 )
         return bodies
 
-    def _init_pairs(self, model: Model, spec: Any, shape_mapping: dict[int, str], template_world: int) -> None:
+    def _init_pairs(
+        self, model: Model, spec: Any, shape_mapping: dict[int, str], template_world: int
+    ) -> list[tuple[str, str]]:
         """
         Initialize MuJoCo contact pairs from custom attributes.
 
@@ -3669,10 +3671,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             spec: The MuJoCo spec to add pairs to.
             shape_mapping: Mapping from Newton shape index to MuJoCo geom name.
             template_world: The world index to use as the template (typically first_group).
+
+        Returns:
+            The MuJoCo geom names of each added pair, in the order the pairs were added.
         """
+        added_pairs: list[tuple[str, str]] = []
         pair_count = model.custom_frequency_counts.get("mujoco:pair", 0)
         if pair_count == 0:
-            return
+            return added_pairs
 
         mujoco_attrs = model.mujoco
 
@@ -3684,7 +3690,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         pair_geom1 = get_numpy("pair_geom1")
         pair_geom2 = get_numpy("pair_geom2")
         if pair_world is None or pair_geom1 is None or pair_geom2 is None:
-            return
+            return added_pairs
 
         pair_condim = get_numpy("pair_condim")
         pair_solref = get_numpy("pair_solref")
@@ -3762,6 +3768,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 pair_kwargs["friction"] = pair_friction[i].tolist()
 
             spec.add_pair(**pair_kwargs)
+            added_pairs.append((geom_name1, geom_name2))
+
+        return added_pairs
 
     @staticmethod
     def _validate_tendon_attributes(model: Model) -> tuple[int, int, int]:
@@ -4805,6 +4814,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self.mjc_geom_to_newton_shape: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, geom] to Newton shape index. Shape [nworld, ngeom], dtype int32."""
         self._mjc_site_to_newton_shape: wp.array2d[wp.int32] | None = None
+        # Position of each compiled MuJoCo pair among the pairs added to the spec [npair].
+        self._mjc_pair_to_spec_pair: wp.array[wp.int32] | None = None
         self.mjc_jnt_to_newton_jnt: wp.array2d[wp.int32] | None = None
         """Mapping from MuJoCo [world, joint] to Newton joint index. Shape [nworld, njnt], dtype int32."""
         self.mjc_jnt_to_newton_dof: wp.array2d[wp.int32] | None = None
@@ -9356,7 +9367,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             spec.add_exclude(bodyname1=spec.bodies[mb1].name, bodyname2=spec.bodies[mb2].name)
 
         # add explicit contact pairs from custom attributes
-        self._init_pairs(model, spec, shape_mapping, first_world)
+        spec_pair_geoms = self._init_pairs(model, spec, shape_mapping, first_world)
 
         particle_bodies = self._init_flexes(model, spec, shape_mapping, selected_particles)
 
@@ -9580,6 +9591,21 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             site_idx = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_SITE, site_name)
             if site_idx >= 0:
                 site_to_shape_idx[site_idx] = shape
+
+        # MuJoCo's compiler stable-sorts explicit contact pairs by the ids of their
+        # two bodies and puts the geom of the lower body id first, so the compiled
+        # pairs need not follow the order in which _init_pairs added them. Find
+        # each compiled pair's position among the added pairs by its two geoms.
+        added_pair_positions: dict[tuple[int, ...], list[int]] = {}
+        for position, geom_names in enumerate(spec_pair_geoms):
+            geoms = sorted(mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in geom_names)
+            added_pair_positions.setdefault(tuple(geoms), []).append(position)
+        mjc_pair_to_spec_pair = np.empty(self.mj_model.npair, dtype=np.int32)
+        for pair in range(self.mj_model.npair):
+            geoms = sorted((int(self.mj_model.pair_geom1[pair]), int(self.mj_model.pair_geom2[pair])))
+            # Pairs of the same two geoms keep their relative order in the stable sort.
+            mjc_pair_to_spec_pair[pair] = added_pair_positions[tuple(geoms)].pop(0)
+        self._mjc_pair_to_spec_pair = wp.array(mjc_pair_to_spec_pair, dtype=wp.int32, device=model.device)
 
         with wp.ScopedDevice(model.device):
             # create the MuJoCo Warp model
@@ -11506,6 +11532,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 dim=(world_count, npair),
                 inputs=[
                     pairs_per_world,
+                    self._mjc_pair_to_spec_pair,
                     pair_solref,
                     pair_solreffriction,
                     pair_solimp,
